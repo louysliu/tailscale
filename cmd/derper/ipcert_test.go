@@ -19,6 +19,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"sync"
 	"testing"
@@ -331,7 +332,7 @@ func TestIPCertManager(t *testing.T) {
 	dir := t.TempDir()
 	ca := newFakeIPACME(t)
 
-	m, err := newIPCertManager(dir, "test@example.com", ca.directoryURL(), nil)
+	m, err := newIPCertManager(dir, "test@example.com", ca.directoryURL(), netip.Addr{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -396,7 +397,7 @@ func TestIPCertManager(t *testing.T) {
 
 	// A second manager over the same cert directory must use the
 	// on-disk cache rather than creating more orders.
-	m2, err := newIPCertManager(dir, "test@example.com", ca.directoryURL(), nil)
+	m2, err := newIPCertManager(dir, "test@example.com", ca.directoryURL(), netip.Addr{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -421,13 +422,62 @@ func TestIPCertManager(t *testing.T) {
 	}
 }
 
+// TestIPCertManagerHostnameIP verifies that an IP --hostname controls
+// issuance even when connections arrive on a different address behind NAT.
+func TestIPCertManagerHostnameIP(t *testing.T) {
+	for _, host := range []string{"203.0.113.7", "2001:db8::7", "::ffff:203.0.113.7"} {
+		t.Run(host, func(t *testing.T) {
+			ca := newFakeIPACME(t)
+			cp, err := certProviderByCertMode("letsencrypt", t.TempDir(), host, true, "", "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			m := cp.(*ipCertManager)
+			m.client.DirectoryURL = ca.directoryURL()
+			challengeSrv := httptest.NewServer(m.HTTPHandler(http.NotFoundHandler()))
+			defer challengeSrv.Close()
+			ca.challengeBase = challengeSrv.URL
+
+			const localIP = "10.0.0.7"
+			getCert := cp.TLSConfig().GetCertificate
+			for _, sni := range []string{"", host} {
+				cert, err := getCert(helloFor(t, localIP, sni))
+				if err != nil {
+					t.Fatalf("getCertificate with SNI %q: %v", sni, err)
+				}
+				if err := cert.Leaf.VerifyHostname(host); err != nil {
+					t.Errorf("issued cert not valid for %v: %v", host, err)
+				}
+				if err := cert.Leaf.VerifyHostname(localIP); err == nil {
+					t.Error("issued cert covers the local IP instead of only the configured IP")
+				}
+			}
+			// A configured IP also works when the connection address is unavailable.
+			if _, err := getCert(&tls.ClientHelloInfo{}); err != nil {
+				t.Errorf("getCertificate without a connection: %v", err)
+			}
+			for _, sni := range []string{localIP, "203.0.113.8", "derp.example.com"} {
+				if _, err := getCert(helloFor(t, localIP, sni)); err == nil {
+					t.Errorf("getCertificate with mismatched SNI %q succeeded", sni)
+				}
+			}
+			if want := netip.MustParseAddr(host).Unmap().String(); ca.gotIDType != "ip" || ca.gotIDValue != want {
+				t.Errorf("order identifier = %q %q; want ip %q", ca.gotIDType, ca.gotIDValue, want)
+			}
+			if n := ca.numOrders(); n != 1 {
+				t.Errorf("orders created = %d; want 1", n)
+			}
+		})
+	}
+}
+
 // TestIPCertManagerNextProvider verifies that connections with a DNS
 // name in the SNI are passed through to the next provider.
 func TestIPCertManagerNextProvider(t *testing.T) {
 	dir := t.TempDir()
 	ca := newFakeIPACME(t)
 	stubCert := &tls.Certificate{}
-	m, err := newIPCertManager(dir, "", ca.directoryURL(), &stubCertProvider{cert: stubCert})
+	m, err := newIPCertManager(dir, "", ca.directoryURL(), netip.Addr{}, &stubCertProvider{cert: stubCert})
 	if err != nil {
 		t.Fatal(err)
 	}

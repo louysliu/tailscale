@@ -43,19 +43,20 @@ const shortlivedProfile = "shortlived"
 // served on the derper's plaintext HTTP port.
 //
 // Clients connecting to an IP address usually send no SNI, so the
-// requested IP address is taken from the TCP connection's local
-// address. That works for however many IPv4 and IPv6 addresses the
-// server has, with no configuration. Clients that do send an IP
-// address in the SNI get a certificate only if it matches the
-// connection's local address, so a client can never make us request a
-// certificate for an address that isn't ours.
+// requested IP address is taken from --hostname when it is an IP address,
+// or otherwise from the TCP connection's local address. The former supports
+// servers behind NAT; the latter supports multiple IPv4 and IPv6 addresses
+// without per-address configuration. Clients that send an IP address in
+// the SNI get a certificate only if it matches the selected address, so a
+// client cannot make us request a certificate for an arbitrary address.
 //
 // Connections with a DNS name in the SNI are passed through to the
 // optional next provider (the regular autocert manager for the
 // --hostname certificate), if any.
 type ipCertManager struct {
 	certDir string
-	email   string // optional ACME account contact
+	hostIP  netip.Addr // IP from --hostname, or invalid to use the connection address
+	email   string     // optional ACME account contact
 	client  *acme.Client
 	next    certProvider // provider for DNS hostname connections, or nil
 	nextTLS *tls.Config  // next.TLSConfig(), or nil
@@ -77,12 +78,13 @@ type ipCertEntry struct {
 }
 
 // newIPCertManager returns an ipCertManager storing its ACME account
-// key and issued certificates in certdir.
+// key and issued certificates in certdir. If hostIP is valid, certificates
+// are issued for that IP instead of the connection's local address.
 //
 // If directoryURL is empty, the LetsEncrypt production directory is
 // used; tests point it at a fake ACME server. If next is non-nil,
 // connections with a DNS name in the SNI are served by it.
-func newIPCertManager(certdir, email, directoryURL string, next certProvider) (*ipCertManager, error) {
+func newIPCertManager(certdir, email, directoryURL string, hostIP netip.Addr, next certProvider) (*ipCertManager, error) {
 	if err := os.MkdirAll(certdir, 0700); err != nil {
 		return nil, err
 	}
@@ -92,6 +94,7 @@ func newIPCertManager(certdir, email, directoryURL string, next certProvider) (*
 	}
 	m := &ipCertManager{
 		certDir: certdir,
+		hostIP:  hostIP.Unmap(),
 		email:   email,
 		client: &acme.Client{
 			Key:          accountKey,
@@ -172,7 +175,10 @@ func connLocalIP(hi *tls.ClientHelloInfo) (netip.Addr, bool) {
 }
 
 func (m *ipCertManager) getCertificate(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
-	connIP, connIPOK := connLocalIP(hi)
+	ip := m.hostIP
+	if !ip.IsValid() {
+		ip, _ = connLocalIP(hi)
+	}
 	if hi.ServerName != "" {
 		sniIP, err := netip.ParseAddr(hi.ServerName)
 		if err != nil {
@@ -182,18 +188,18 @@ func (m *ipCertManager) getCertificate(hi *tls.ClientHelloInfo) (*tls.Certificat
 			}
 			return nil, fmt.Errorf("no certificate for hostname %q; this server only serves IP address certificates", hi.ServerName)
 		}
-		if !connIPOK || sniIP.Unmap() != connIP {
-			return nil, fmt.Errorf("requested certificate for IP %v does not match the connection's IP address", sniIP)
+		if !ip.IsValid() || sniIP.Unmap() != ip {
+			return nil, fmt.Errorf("requested certificate for IP %v does not match the configured or connection IP address", sniIP)
 		}
 	}
-	if !connIPOK {
+	if !ip.IsValid() {
 		return nil, errors.New("unable to determine the connection's local IP address")
 	}
 	ctx := hi.Context()
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return m.certForIP(ctx, connIP)
+	return m.certForIP(ctx, ip)
 }
 
 // certForIP returns the current certificate for ip, obtaining one

@@ -20,6 +20,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -53,16 +54,16 @@ func certProviderByCertMode(mode, dir, hostname string, ipCerts bool, eabKID, ea
 	}
 	switch mode {
 	case "letsencrypt", "gcp":
-		if net.ParseIP(hostname) != nil {
+		if hostIP, err := netip.ParseAddr(hostname); err == nil && hostIP.Zone() == "" {
 			if mode == "gcp" {
 				return nil, errors.New("--certmode=gcp requires --hostname to be a DNS name, not an IP address")
 			}
 			if !ipCerts {
 				return nil, errors.New("--hostname is an IP address; use --certmode=manual for a self-signed cert, or set --acme-ip-certs to get LetsEncrypt IP address certs")
 			}
-			// IP-only server: certs are issued on demand per
-			// connection, so there is no hostname cert provider.
-			return newIPCertManager(dir, email, "", nil)
+			// IP-only server: issue certs for the configured IP, even
+			// when the connection arrives on a different address behind NAT.
+			return newIPCertManager(dir, email, "", hostIP, nil)
 		}
 		certManager := &autocert.Manager{
 			Prompt:     autocert.AcceptTOS,
@@ -97,7 +98,7 @@ func certProviderByCertMode(mode, dir, hostname string, ipCerts bool, eabKID, ea
 			certManager.Email = "security@tailscale.com"
 		}
 		if ipCerts {
-			return newIPCertManager(dir, email, "", certManager)
+			return newIPCertManager(dir, email, "", netip.Addr{}, certManager)
 		}
 		return certManager, nil
 	case "manual":
